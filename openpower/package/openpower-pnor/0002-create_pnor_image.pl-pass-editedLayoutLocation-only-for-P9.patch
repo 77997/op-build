@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bear <61359476+bearnl@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 00:50:26 -0230
+Subject: [PATCH] create_pnor_image.pl: pass --editedLayoutLocation only for
+ P9
+
+Only the POWER9 buildpnor.pl knows the --editedLayoutLocation option.
+The POWER8 one (hostboot master-p8) answers any argument it does not
+recognise with "Unrecognized Input" and exit status 1, so no POWER8
+PNOR can be assembled while the option is passed unconditionally.
+
+Pass it only when building a P9 image, as update_image.pl already
+does through processConvergedSections().
+---
+ create_pnor_image.pl | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/create_pnor_image.pl b/create_pnor_image.pl
+index dfd1480..beb5e07 100755
+--- a/create_pnor_image.pl
++++ b/create_pnor_image.pl
+@@ -150,7 +150,11 @@ print "scratch_dir = $scratch_dir\n";
+ print "pnor_data_dir = $pnor_data_dir\n";
+ 
+ my $build_pnor_command = "$hb_image_dir/buildpnor.pl";
+-$build_pnor_command .= " --pnorOutBin $pnor_filename --pnorLayout $xml_layout_file --editedLayoutLocation $hb_image_dir";
++$build_pnor_command .= " --pnorOutBin $pnor_filename --pnorLayout $xml_layout_file";
++if ($release eq "p9")
++{
++    $build_pnor_command .= " --editedLayoutLocation $hb_image_dir";
++}
+ 
+ # Process HBD section and possibly HBD_RW section
+ if (checkForPnorPartition("HBD_RW", $parsed_pnor_layout))

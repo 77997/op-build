@@ -34,7 +34,8 @@ cd op-build
 
 There are also default configurations for other platforms in
 `openpower/configs/`. Current POWER9 platforms include Witherspoon,
-Boston (p9dsu), Romulus, and Zaius.
+Boston (p9dsu), Romulus, and Zaius. The only POWER8 platform is
+Firestone (S822LC, 8335-GCA).
 
 Buildroot/op-build supports both native and cross-compilation - it will
 automatically download and build an appropriate toolchain as part of the build

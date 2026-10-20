@@ -41,5 +41,14 @@ define HOSTBOOT_BINARIES_INSTALL_IMAGES_CMDS
 endef
 endif
 
+ifeq ($(BR2_OPENPOWER_POWER8),y)
+define HOSTBOOT_BINARIES_INSTALL_IMAGES_CMDS
+     $(INSTALL) -D $(@D)/cvpd.bin  $(STAGING_DIR)/hostboot_binaries/cvpd.bin
+     $(INSTALL) -D $(@D)/$(BR2_HOSTBOOT_BINARY_WINK_FILENAME) $(STAGING_DIR)/hostboot_binaries/
+     $(INSTALL) -D $(@D)/$(BR2_HOSTBOOT_BINARY_SBEC_FILENAME) $(STAGING_DIR)/hostboot_binaries/
+     $(INSTALL) -D $(@D)/$(BR2_HOSTBOOT_BINARY_SBE_FILENAME)  $(STAGING_DIR)/hostboot_binaries/
+endef
+endif
+
 
 $(eval $(generic-package))

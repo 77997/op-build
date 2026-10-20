@@ -1,0 +1,21 @@
+config BR2_PACKAGE_HOSTBOOT_P8
+        bool "hostboot-p8"
+        default y if (BR2_OPENPOWER_POWER8)
+        select BR2_CPP
+        select BR2_PACKAGE_ALTERNATE_GCC
+        help
+            Project to build the hostboot firmware codebase for POWER8.
+            It is always built with the Alternate Toolchain: its code
+            builds with -Werror and has never been built with a GCC
+            newer than 6, and its host tools need the libbfd API that
+            binutils 2.34 removed.
+
+if BR2_PACKAGE_HOSTBOOT_P8
+
+config BR2_HOSTBOOT_P8_CONFIG_FILE
+        string "Hostboot configuration file for compilation"
+        default default
+        help
+            String used to define hw specific make config file
+
+endif

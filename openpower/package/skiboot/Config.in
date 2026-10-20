@@ -45,6 +45,14 @@ config BR2_SKIBOOT_CUSTOM_REPO_URL
 config BR2_SKIBOOT_DEVICETREE
 	bool "Build device trees"
 
+config BR2_SKIBOOT_EXTRA_MAKE_OPTS
+	string "Extra make options"
+	help
+	  Additional variable assignments passed on the skiboot make
+	  command line, for example "CONFIG_FSP=0 CONFIG_PLDM=0" to
+	  leave out FSP and PLDM support. Leave empty to build with
+	  skiboot's own defaults.
+
 endif
 
 endmenu

@@ -1,0 +1,47 @@
+From 2170d56393191b4a5590556d6ce80d6a85943b7a Mon Sep 17 00:00:00 2001
+From: Bear <61359476+bearnl@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:52:31 -0230
+Subject: [PATCH] powerpc/powernv/rng: retry rng_create() from
+ pnv_rng_late_init()
+
+pnv_get_random_long_early() spends its single shot as soon as
+slab_is_available(), but the first request for random bytes can arrive
+from inside kmem_cache_init() itself: with CONFIG_SLAB_FREELIST_RANDOM
+the freelist shuffle runs right after slab_state becomes UP and before
+vmalloc_init().  rng_create() then fails in of_iomap(), both
+ibm,power-rng nodes are dropped, ppc_md.get_random_seed is left NULL and
+pnv_rng_late_init() creates no platform device.  On a POWER8 OpenPOWER
+machine (no darn) the hardware RNG is therefore never initialised.
+
+If something else populates the ibm,power-rng platform devices, for
+example mtd_part_of_parse() calling of_platform_populate() with a NULL
+node, the powernv-rng driver binds and dereferences the NULL per-CPU
+pnv_rng pointer in pnv_get_random_long().
+
+Retry rng_create() from pnv_rng_late_init() when the early attempt left
+no seed hook, at which point ioremap() works.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ arch/powerpc/platforms/powernv/rng.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/powerpc/platforms/powernv/rng.c b/arch/powerpc/platforms/powernv/rng.c
+index 196aa70fe..a0c7aa257 100644
+--- a/arch/powerpc/platforms/powernv/rng.c
++++ b/arch/powerpc/platforms/powernv/rng.c
+@@ -190,6 +190,11 @@ static int __init pnv_rng_late_init(void)
+ 	if (ppc_md.get_random_seed == pnv_get_random_long_early)
+ 		pnv_get_random_long_early(&v);
+ 
++	if (!ppc_md.get_random_seed) {
++		for_each_compatible_node(dn, NULL, "ibm,power-rng")
++			rng_create(dn);
++	}
++
+ 	if (ppc_md.get_random_seed == pnv_get_random_long) {
+ 		for_each_compatible_node(dn, NULL, "ibm,power-rng")
+ 			of_platform_device_create(dn, NULL, NULL);
+-- 
+2.50.1 (Apple Git-155)
+

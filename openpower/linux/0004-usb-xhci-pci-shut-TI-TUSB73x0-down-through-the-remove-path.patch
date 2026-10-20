@@ -1,0 +1,114 @@
+From 8d521c233f67cde4df53f7441057d3a57405bdf4 Mon Sep 17 00:00:00 2001
+From: Bear <61359476+bearnl@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 11:06:51 -0230
+Subject: [PATCH] usb: xhci-pci: shut TI TUSB73x0 down through the remove path
+
+The TI TUSB73x0 (104c:8241) does not set USBSTS.HCHalted when
+USBCMD.Run/Stop is cleared while its device slots still have endpoints
+configured.  xhci_shutdown() does exactly that, so every shutdown logs
+"Host halt failed, -110" and leaves the controller with Run/Stop and
+HCHalted both clear and its DCBAAP and CONFIG registers still holding
+the old kernel's values.  A cold boot recovers through PERST#, but a
+kexec'd kernel inherits the stuck controller: quirk_usb_handoff_xhci()
+reports "xHCI HW did not halt within 32000 usec status = 0x0" and
+xhci_gen_setup() fails with -110.  The secondary bus reset that
+op-build adds to xhci_shutdown() does not bring it back either.
+
+On the IBM Power S822LC (8335-GCA) the BMC's virtual hub, CD-ROM,
+floppy and HID devices are always attached to this controller, so every
+kexec from Petitboot into the host OS loses USB.
+
+Flag the controller XHCI_DECONFIG_BEFORE_HALT and shut it down through
+xhci_pci_remove(): usb_disconnect() drops every endpoint with a
+configuration 0 Configure Endpoint command, which xhci_check_bandwidth()
+now lets through during removal for flagged controllers, and disables
+each slot; xhci_stop() then halts the controller and resets it with
+HCRST.  This restores what OpenPOWER firmware ran on these machines up
+to Linux 4.4 ("xhci: Use xhci_pci_remove for xhci device shutdown" and
+"usb/xhci: allow xhci_check_bandwith in XHCI_STATE_REMOVING").
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/usb/host/xhci-pci.c | 27 +++++++++++++++++++++++++--
+ drivers/usb/host/xhci.c     |  3 ++-
+ drivers/usb/host/xhci.h     |  1 +
+ 3 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index 5f6052845..68f42b1a7 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -484,7 +484,8 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 		xhci->quirks |= XHCI_RESET_ON_RESUME;
+ 
+ 	if (pdev->vendor == PCI_VENDOR_ID_TI && pdev->device == 0x8241)
+-		xhci->quirks |= XHCI_LIMIT_ENDPOINT_INTERVAL_7;
++		xhci->quirks |= XHCI_LIMIT_ENDPOINT_INTERVAL_7 |
++				XHCI_DECONFIG_BEFORE_HALT;
+ 
+ 	if ((pdev->vendor == PCI_VENDOR_ID_BROADCOM ||
+ 	     pdev->vendor == PCI_VENDOR_ID_CAVIUM) &&
+@@ -737,6 +738,28 @@ void xhci_pci_remove(struct pci_dev *dev)
+ }
+ EXPORT_SYMBOL_NS_GPL(xhci_pci_remove, xhci);
+ 
++/**
++ * xhci_pci_shutdown_dev - PCI shutdown callback of the xHCI PCI driver
++ * @dev: PCI device being shut down
++ *
++ * A controller flagged XHCI_DECONFIG_BEFORE_HALT never sets HCHalted when
++ * Run/Stop is cleared while device slots still have endpoints configured,
++ * so after a kexec the next kernel cannot halt it either.  Tear such a
++ * controller down through xhci_pci_remove(), which deconfigures and
++ * disables every slot before xhci_stop() halts and resets it.
++ */
++static void xhci_pci_shutdown_dev(struct pci_dev *dev)
++{
++	struct usb_hcd *hcd = pci_get_drvdata(dev);
++
++	if (hcd && (hcd_to_xhci(hcd)->quirks & XHCI_DECONFIG_BEFORE_HALT)) {
++		xhci_pci_remove(dev);
++		return;
++	}
++
++	usb_hcd_pci_shutdown(dev);
++}
++
+ /*
+  * In some Intel xHCI controllers, in order to get D3 working,
+  * through a vendor specific SSIC CONFIG register at offset 0x883c,
+@@ -959,7 +982,7 @@ static struct pci_driver xhci_pci_driver = {
+ 	.remove =	xhci_pci_remove,
+ 	/* suspend and resume implemented later */
+ 
+-	.shutdown = 	usb_hcd_pci_shutdown,
++	.shutdown = 	xhci_pci_shutdown_dev,
+ 	.driver = {
+ 		.pm = pm_ptr(&usb_hcd_pci_pm_ops),
+ 	},
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 24f389104..00cc721da 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -2926,7 +2926,8 @@ int xhci_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+ 		return ret;
+ 	xhci = hcd_to_xhci(hcd);
+ 	if ((xhci->xhc_state & XHCI_STATE_DYING) ||
+-		(xhci->xhc_state & XHCI_STATE_REMOVING))
++	    ((xhci->xhc_state & XHCI_STATE_REMOVING) &&
++	     !(xhci->quirks & XHCI_DECONFIG_BEFORE_HALT)))
+ 		return -ENODEV;
+ 
+ 	xhci_dbg(xhci, "%s called for udev %p\n", __func__, udev);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index b4fa8e7e4..cdedd72b5 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1630,6 +1630,7 @@ struct xhci_hcd {
+ #define XHCI_CDNS_SCTX_QUIRK	BIT_ULL(48)
+ #define XHCI_ETRON_HOST	BIT_ULL(49)
+ #define XHCI_LIMIT_ENDPOINT_INTERVAL_9 BIT_ULL(50)
++#define XHCI_DECONFIG_BEFORE_HALT	BIT_ULL(51)
+ 
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;

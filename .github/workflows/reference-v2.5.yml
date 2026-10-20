@@ -1,0 +1,234 @@
+name: Reference build (op-build v2.5 firestone)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cold:
+        description: 'Skip restoring the dl/ cache'
+        type: boolean
+        default: false
+
+concurrency:
+  group: reference-v2.5-firestone
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  OPBUILD_TAG: v2.5
+  OPBUILD_COMMIT: f4a4e3fcd87118fa63989ee657e55e1cff026ff1
+  BUILDROOT_COMMIT: 522600dd45a0200a420d3d28fe166e82f40594b5
+  BASE_IMAGE: ubuntu:18.04@sha256:dca176c9663a7ba4c1f0e710986f5a25e672842963d95b960191e2d9f7185ebe
+
+jobs:
+  reference:
+    name: Build upstream v2.5 firestone_defconfig
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      SRC: ${{ github.workspace }}/op-build-v2.5
+      IMAGE: op-build-v2.5-reference:local
+      CONTAINER: op-build-v2.5-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache
+          df -h /
+          mkdir -p "$GITHUB_WORKSPACE"
+          free_gb=$(df --output=avail --block-size=1G "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')
+          if [ "$free_gb" -lt 40 ]; then
+            echo "::error::only ${free_gb} GB free for the workspace, at least 40 GB are needed"
+            exit 1
+          fi
+          echo "${free_gb} GB free for the workspace"
+
+      - name: Clone upstream op-build v2.5
+        run: |
+          git clone --branch "$OPBUILD_TAG" https://github.com/open-power/op-build.git "$SRC"
+          commit=$(git -C "$SRC" rev-parse HEAD)
+          if [ "$commit" != "$OPBUILD_COMMIT" ]; then
+            echo "::error::tag $OPBUILD_TAG resolves to $commit, expected $OPBUILD_COMMIT"
+            exit 1
+          fi
+          git -C "$SRC" submodule update --init
+          buildroot=$(git -C "$SRC/buildroot" rev-parse HEAD)
+          if [ "$buildroot" != "$BUILDROOT_COMMIT" ]; then
+            echo "::error::buildroot is at $buildroot, expected $BUILDROOT_COMMIT"
+            exit 1
+          fi
+          mkdir -p "$SRC/dl"
+
+      - name: Restore download cache
+        id: dl-cache
+        if: ${{ !inputs.cold }}
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            op-build-v2.5/dl
+            !op-build-v2.5/dl/*/git
+          key: dl-reference-v2.5-${{ github.run_id }}
+          restore-keys: |
+            dl-reference-v2.5-
+
+      - name: Build the ubuntu:18.04 build image
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --build-arg BUILDER_UID="$(id -u)" \
+            --build-arg BUILDER_GID="$(id -g)" \
+            --tag "$IMAGE" - <<'EOF'
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          ARG BUILDER_UID
+          ARG BUILDER_GID
+          RUN test -n "${BUILDER_UID}" && test -n "${BUILDER_GID}"
+          RUN sed -e 's/main$/main universe/' --in-place=orig /etc/apt/sources.list
+          RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+              DEBIAN_FRONTEND=noninteractive apt-get install -yy --no-install-recommends \
+                    cscope ctags libz-dev libexpat-dev \
+                    python language-pack-en texinfo gawk cpio xxd \
+                    build-essential g++ git bison flex unzip \
+                    libssl-dev libxml-simple-perl libxml-sax-perl libxml-parser-perl libxml2-dev libxml2-utils xsltproc \
+                    wget bc rsync \
+                    eatmydata python-matplotlib python-numpy graphviz bsdmainutils lsb-release \
+                    libxml-libxml-perl libc6-dev file xz-utils bzip2 patch perl \
+                    locales ca-certificates && \
+              rm -rf /var/lib/apt/lists/*
+          RUN locale-gen en_US.UTF-8 && \
+              update-locale LANG=en_US.UTF-8 && \
+              locale -a | grep -qx 'en_US.utf8'
+          RUN perl -MXML::LibXML -MXML::Simple -MXML::Parser -e 1 && \
+              command -v yacc && command -v bison && command -v flex
+          RUN git config --system --add safe.directory '*'
+          RUN if ! getent group "${BUILDER_GID}" > /dev/null; then \
+                  groupadd --gid "${BUILDER_GID}" builder; \
+              fi && \
+              useradd --uid "${BUILDER_UID}" --gid "${BUILDER_GID}" --create-home --shell /bin/bash builder
+          ENV LANG=en_US.UTF-8
+          USER builder
+          WORKDIR /home/builder
+          EOF
+
+      - name: Build
+        id: build
+        timeout-minutes: 320
+        run: |
+          docker run --rm --name "$CONTAINER" \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/home/builder \
+            --env LANG=en_US.UTF-8 \
+            --volume "$SRC:$SRC" \
+            --workdir "$SRC" \
+            "$IMAGE" \
+            bash -c '
+              set -euo pipefail
+              ./op-build firestone_defconfig
+              drifted=0
+              while IFS= read -r line; do
+                case "$line" in
+                BR2_*=* | "# BR2_"*" is not set") ;;
+                *) continue ;;
+                esac
+                if ! grep -qxF -- "$line" output/.config; then
+                  echo "DRIFT: $line"
+                  drifted=$((drifted + 1))
+                fi
+              done < openpower/configs/firestone_defconfig
+              for line in "BR2_GCC_VERSION=\"6.5.0\"" "BR2_BINUTILS_VERSION=\"2.31.1\"" "BR2_powerpc_power8=y"; do
+                if ! grep -qxF -- "$line" output/.config; then
+                  echo "MISSING: $line"
+                  drifted=$((drifted + 1))
+                fi
+              done
+              if [ "$drifted" -ne 0 ]; then
+                echo "error: the v2.5 reference configuration drifted ($drifted lines)" >&2
+                exit 1
+              fi
+              ./op-build hostboot-p8
+              ./op-build
+            ' 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Stop the build container
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        run: |
+          if [ -n "$(docker ps --quiet --filter "name=^${CONTAINER}\$")" ]; then
+            docker kill "$CONTAINER"
+          fi
+
+      - name: Collect reference outputs
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        run: |
+          out="$GITHUB_WORKSPACE/reference"
+          mkdir -p "$out/logs" "$out/hostboot/generated" "$out/pnor" "$out/images"
+          copy() {
+            local src
+            local dst=${!#}
+            for src in "${@:1:$#-1}"; do
+              if [ -e "$src" ]; then
+                cp -a -L "$src" "$dst"
+              else
+                echo "not produced: $src"
+              fi
+            done
+          }
+          cd "$SRC"
+          copy "$GITHUB_WORKSPACE/build.log" "$out/logs/"
+          copy output/build/build-time.log "$out/logs/"
+          copy output/.config "$out/logs/buildroot.config"
+          copy output/build/linux-[0-9]*/.config "$out/logs/linux.config"
+          git describe --always --dirty > "$out/logs/op-build-describe.txt"
+          copy output/host/powerpc64le-buildroot-linux-gnu/sysroot/hostboot_build_images "$out/hostboot/"
+          copy output/build/hostboot-p8-*/src/usr/devtree/bld_devtree.C "$out/hostboot/"
+          copy output/build/hostboot-p8-*/img/*.if output/build/hostboot-p8-*/img/*.prf "$out/hostboot/generated/"
+          copy output/build/hostboot-p8-*/obj/genfiles "$out/hostboot/generated/"
+          copy output/host/powerpc64le-buildroot-linux-gnu/sysroot/openpower_pnor_scratch "$out/pnor/"
+          copy output/host/powerpc64le-buildroot-linux-gnu/sysroot/openpower_version "$out/pnor/"
+          copy output/host/powerpc64le-buildroot-linux-gnu/sysroot/openpower_mrw_scratch "$out/pnor/"
+          copy output/images/firestone.pnor output/images/firestone_update.pnor "$out/images/"
+          {
+            echo "REFERENCE ONLY. These images come from upstream op-build v2.5 and"
+            echo "exist for bit-comparison with the forward-ported build. Never flash them."
+          } > "$out/images/README-DO-NOT-FLASH.txt"
+          du -sh "$out"/*
+
+      - name: Upload reference logs
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: reference-v2.5-logs
+          path: reference/logs
+          retention-days: 5
+
+      - name: Upload reference hostboot outputs
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: reference-v2.5-hostboot
+          path: reference/hostboot
+          retention-days: 5
+
+      - name: Upload reference PNOR scratch and images
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: reference-v2.5-pnor
+          path: |
+            reference/pnor
+            reference/images
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Save download cache
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            op-build-v2.5/dl
+            !op-build-v2.5/dl/*/git
+          key: dl-reference-v2.5-${{ github.run_id }}

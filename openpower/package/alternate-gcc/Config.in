@@ -19,4 +19,15 @@ config BR2_ALTERNATE_GCC_EXTRA_CONFIG_OPTIONS
 		  Any extra options to the Alternate Toolchain's gcc configure script
 		  The default is taken from EXTRA_GCC_CONFIG_OPTIONS
 
+config BR2_ALTERNATE_GCC_COMPILER_ONLY
+		bool "Build only the Alternate Toolchain compiler"
+		default n
+		help
+		  Build and install only the compiler proper (make all-gcc and
+		  make install-gcc), without libgcc, libstdc++ or any other
+		  target library. This suits packages that build freestanding
+		  code and never link the compiler's libraries, and allows an
+		  older GCC whose target libraries no longer build against the
+		  current C library.
+
 endif

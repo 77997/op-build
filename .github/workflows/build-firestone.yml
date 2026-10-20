@@ -1,0 +1,489 @@
+name: Build Firestone firmware
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'openpower/**'
+      - 'buildroot'
+      - 'ci/firestone/**'
+      - '.github/workflows/build-firestone.yml'
+    tags:
+      - 'firestone-v*'
+  workflow_dispatch:
+    inputs:
+      make_target:
+        description: 'Buildroot targets to build instead of the full image, e.g. hostboot-p8. Empty: full build, PNOR check, smoke boot.'
+        type: string
+        default: ''
+      cold:
+        description: 'Skip restoring the dl/ and ccache caches'
+        type: boolean
+        default: false
+      publish:
+        description: 'Publish a snapshot release (full builds only)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-firestone-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE_REPO: ghcr.io/77997/op-build-ci
+
+jobs:
+  image:
+    name: CI container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ref: ${{ steps.tag.outputs.ref }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Compute the image tag
+        id: tag
+        run: |
+          hash=$(sha256sum ci/firestone/Dockerfile | cut -c1-16)
+          echo "ref=${IMAGE_REPO}:${hash}-uid$(id -u)-gid$(id -g)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+
+      - name: Build and push the image unless it exists
+        env:
+          IMAGE: ${{ steps.tag.outputs.ref }}
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "$IMAGE already exists"
+            exit 0
+          fi
+          docker build \
+            --build-arg BUILDER_UID="$(id -u)" \
+            --build-arg BUILDER_GID="$(id -g)" \
+            --tag "$IMAGE" \
+            ci/firestone
+          docker push "$IMAGE"
+
+  build:
+    name: Build firestone_defconfig
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.image.outputs.ref }}
+      MAKE_TARGET: ${{ inputs.make_target }}
+      CONTAINER: op-build-firestone-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache
+          df -h /
+          mkdir -p "$GITHUB_WORKSPACE"
+          free_gb=$(df --output=avail --block-size=1G "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')
+          if [ "$free_gb" -lt 40 ]; then
+            echo "::error::only ${free_gb} GB free for the workspace, at least 40 GB are needed"
+            exit 1
+          fi
+          echo "${free_gb} GB free for the workspace"
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Compute cache keys
+        id: keys
+        run: |
+          buildroot=$(git rev-parse HEAD:buildroot)
+          inputs=$(cat openpower/configs/firestone_defconfig \
+            $(git ls-files 'openpower/package/*.mk' 'openpower/package/*.hash') | sha256sum | cut -c1-16)
+          echo "dl=dl-firestone-${buildroot}-${inputs}" >> "$GITHUB_OUTPUT"
+          echo "dl-prefix=dl-firestone-${buildroot}-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore download cache
+        id: dl-cache
+        if: ${{ !inputs.cold }}
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            dl
+            !dl/*/git
+          key: ${{ steps.keys.outputs.dl }}
+          restore-keys: |
+            ${{ steps.keys.outputs.dl-prefix }}
+            dl-firestone-
+
+      - name: Restore ccache
+        if: ${{ !inputs.cold }}
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: ccache-firestone-${{ github.run_id }}
+          restore-keys: |
+            ccache-firestone-
+
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+
+      - name: Pull the CI image
+        run: |
+          docker pull "$IMAGE"
+          image_uid=$(docker run --rm "$IMAGE" id -u)
+          if [ "$image_uid" != "$(id -u)" ]; then
+            echo "::error::$IMAGE runs as uid $image_uid but the runner is uid $(id -u)"
+            exit 1
+          fi
+          mkdir -p dl .ccache
+
+      - name: Build
+        id: build
+        timeout-minutes: 320
+        run: |
+          docker run --rm --name "$CONTAINER" \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/home/builder \
+            --env LANG=en_US.UTF-8 \
+            --env MAKE_TARGET \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --workdir "$GITHUB_WORKSPACE" \
+            "$IMAGE" \
+            ci/firestone/build.sh 2>&1 | tee build.log
+
+      - name: Stop the build container
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        run: |
+          if [ -n "$(docker ps --quiet --filter "name=^${CONTAINER}\$")" ]; then
+            docker kill "$CONTAINER"
+          fi
+
+      - name: Collect build outputs
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        run: |
+          ci/firestone/collect.sh ci-out
+          {
+            echo '```'
+            cat ci-out/logs/sizes.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build logs
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestone-build-logs
+          path: ci-out/logs
+          retention-days: 5
+
+      - name: Upload hostboot outputs
+        if: ${{ always() && steps.build.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestone-hostboot
+          path: ci-out/hostboot
+          retention-days: 5
+
+      - name: Upload images
+        if: ${{ success() && !inputs.make_target }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestone-images
+          path: output/images
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Upload PNOR scratch and version
+        if: ${{ success() && !inputs.make_target }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestone-pnor
+          path: ci-out/pnor
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Upload legal-info
+        if: ${{ success() && !inputs.make_target }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestone-legal-info
+          path: output/legal-info
+          retention-days: 5
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Save download cache
+        if: ${{ always() && github.ref == 'refs/heads/master' && steps.build.outcome != 'skipped' && steps.dl-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            dl
+            !dl/*/git
+          key: ${{ steps.keys.outputs.dl }}
+
+      - name: Save ccache
+        if: ${{ always() && github.ref == 'refs/heads/master' && steps.build.outcome != 'skipped' }}
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ccache-firestone-${{ github.run_id }}
+
+  check:
+    name: PNOR safety check and side-A kit
+    needs: build
+    if: ${{ !inputs.make_target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download images
+        uses: actions/download-artifact@v7
+        with:
+          name: firestone-images
+          path: artefacts/images
+
+      - name: Download PNOR scratch and version
+        uses: actions/download-artifact@v7
+        with:
+          name: firestone-pnor
+          path: artefacts/pnor
+
+      - name: Download hostboot outputs
+        uses: actions/download-artifact@v7
+        with:
+          name: firestone-hostboot
+          path: artefacts/hostboot
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s ci/firestone -v
+
+      - name: Check the PNOR image against compute-2's live layout
+        run: |
+          python3 ci/firestone/check_pnor.py check artefacts/images/firestone.pnor \
+            --fixtures ci/firestone/fixtures \
+            --payload artefacts/pnor/openpower_pnor_scratch/skiboot.lid.xz \
+            --bootkernel artefacts/pnor/openpower_pnor_scratch/zImage.epapr \
+            | tee check-report.txt
+
+      - name: Check hostboot's fw-features table
+        run: |
+          python3 ci/firestone/check_pnor.py fwfeatures artefacts/hostboot/bld_devtree.C \
+            | tee fwfeatures-report.txt
+
+      - name: Size gates
+        run: |
+          status=0
+          gate() {
+            local name=$1 file=$2 limit=$3 size
+            size=$(stat --format=%s "$file")
+            awk -v n="$name" -v s="$size" -v l="$limit" \
+              'BEGIN { printf "%-44s %10d %10d %10d %6.1f%%\n", n, s, l, l - s, 100 * s / l }'
+            if [ "$size" -gt "$limit" ]; then
+              echo "SIZE GATE FAILED: $name is $size bytes, the limit is $limit"
+              status=1
+            fi
+          }
+          {
+            printf '%-44s %10s %10s %10s %7s\n' item bytes limit headroom used
+            gate 'PAYLOAD skiboot.lid.xz (partition)' artefacts/pnor/openpower_pnor_scratch/skiboot.lid.xz 1048576
+            gate 'skiboot.lid (hostboot 16x xz bound)' artefacts/images/skiboot.lid 16777216
+            gate 'BOOTKERNEL zImage.epapr (partition)' artefacts/pnor/openpower_pnor_scratch/zImage.epapr 15728640
+            gate 'HBB hostboot.bin (512K pad - headers)' artefacts/hostboot/hostboot_build_images/img/hostboot.bin 520168
+            gate 'HBI hostboot_extended.bin (5M pad - header)' artefacts/hostboot/hostboot_build_images/img/hostboot_extended.bin 5238784
+            gate 'HBRT hostboot_runtime.bin (3M pad - header)' artefacts/hostboot/hostboot_build_images/img/hostboot_runtime.bin 3141632
+            exit "$status"
+          } | tee size-report.txt
+
+      - name: Cut the side-A kit
+        run: |
+          python3 ci/firestone/check_pnor.py kit artefacts/images/firestone.pnor \
+            --fixtures ci/firestone/fixtures \
+            --payload artefacts/pnor/openpower_pnor_scratch/skiboot.lid.xz \
+            --bootkernel artefacts/pnor/openpower_pnor_scratch/zImage.epapr \
+            --out kit/firestone-side-a-kit
+          cp check-report.txt fwfeatures-report.txt size-report.txt kit/
+          (cd kit/firestone-side-a-kit && sha256sum --check --strict SHA256SUMS)
+
+      - name: Upload the side-A kit
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestone-side-a-kit
+          path: kit
+          retention-days: 5
+          if-no-files-found: error
+
+  smoke:
+    name: QEMU powernv8 smoke boot
+    needs: build
+    if: ${{ !inputs.make_target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download images
+        uses: actions/download-artifact@v7
+        with:
+          name: firestone-images
+          path: artefacts/images
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-ppc
+
+      - name: Boot skiboot and skiroot
+        run: bash ci/firestone/qemu-smoke.sh --log smoke-console.log artefacts/images/skiboot.lid artefacts/images/zImage.epapr
+
+      - name: Upload the console log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: firestone-smoke-console
+          path: smoke-console.log
+          retention-days: 5
+
+  release:
+    name: Publish release
+    needs: [build, check, smoke]
+    if: ${{ !inputs.make_target && (startsWith(github.ref, 'refs/tags/firestone-v') || (github.event_name == 'workflow_dispatch' && inputs.publish)) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Download the side-A kit
+        uses: actions/download-artifact@v7
+        with:
+          name: firestone-side-a-kit
+          path: kit
+
+      - name: Download images
+        uses: actions/download-artifact@v7
+        with:
+          name: firestone-images
+          path: images
+
+      - name: Download legal-info
+        uses: actions/download-artifact@v7
+        with:
+          name: firestone-legal-info
+          path: legal-info
+
+      - name: Assemble release assets
+        id: assets
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            name="$GITHUB_REF_NAME"
+            prerelease=false
+          else
+            name="$(date -u +%Y%m%d)-${GITHUB_SHA:0:10}"
+            prerelease=true
+          fi
+          kitdir=kit/firestone-side-a-kit
+          (cd "$kitdir" && sha256sum --check --strict SHA256SUMS)
+          mkdir release
+
+          tar --create --xz --file "release/firestone-side-a-kit-${name}.tar.xz" \
+            --directory kit \
+            --transform "s,^firestone-side-a-kit,firestone-side-a-kit-${name}," \
+            firestone-side-a-kit
+          cp "$kitdir/manifest.json" "$kitdir/SHA256SUMS" "$kitdir/VERSION" release/
+          cp kit/check-report.txt kit/fwfeatures-report.txt kit/size-report.txt release/
+
+          reference="firestone-${name}-reference-DO-NOT-FLASH-WHOLE"
+          mkdir "$reference"
+          test -f images/firestone.pnor
+          cp images/*.pnor "$reference/"
+          {
+            echo "DO NOT FLASH THESE IMAGES WHOLE."
+            echo
+            echo "They are full-chip reference images of build ${GITHUB_SHA}."
+            echo "They carry freshly generated, blank GUARD, VPD, NVRAM, error-log,"
+            echo "attribute, FIRDATA and SECBOOT partitions, and firestone.pnor also"
+            echo "carries a side B that does not match the golden side installed on"
+            echo "compute-2. Writing any of them erases the machine's own data."
+            echo "Flash only the files of firestone-side-a-kit-${name}.tar.xz, at the"
+            echo "offsets recorded in its manifest.json."
+          } > "$reference/README-DO-NOT-FLASH.txt"
+          tar --create --xz --file "release/${reference}.tar.xz" "$reference"
+
+          tar --create --file - legal-info |
+            split --bytes=1900M --numeric-suffixes=0 --suffix-length=2 - \
+              "release/firestone-${name}-legal-info.tar.part"
+
+          (cd release && sha256sum -- * > assets.sha256)
+
+          {
+            echo "Firestone (IBM Power S822LC 8335-GCA) host firmware built from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            echo
+            echo '```'
+            cat "$kitdir/VERSION"
+            echo '```'
+            echo
+            echo "Flash only the side-A kit (firestone-side-a-kit-${name}.tar.xz): toc0.bin belongs at 0x0, toc1.bin at 0x1FF8000 and every partition file at the base recorded in manifest.json. It never contains a shared or data partition."
+            echo
+            echo "${reference}.tar.xz holds full-chip images for reference only. Never write them whole: they carry blank GUARD, VPD, NVRAM and other data partitions and a side B that does not match the installed golden side."
+            echo
+            echo "legal-info (buildroot sources and licences) is split into parts below 2 GiB; rebuild it with: cat firestone-${name}-legal-info.tar.part* | tar -x"
+          } > notes.md
+
+          echo "tag=firestone/${name}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          ls -l release
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.assets.outputs.tag }}
+          NAME: ${{ steps.assets.outputs.name }}
+          PRERELEASE: ${{ steps.assets.outputs.prerelease }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Firestone firmware ${NAME}" \
+            --notes-file notes.md \
+            "${flags[@]}" \
+            release/*
+
+      - name: Remove old snapshot releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName,createdAt \
+            --jq 'map(select(.tagName | test("^firestone/[0-9]{8}-[0-9a-f]{10}$"))) | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' |
+            while read -r tag; do
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            done
